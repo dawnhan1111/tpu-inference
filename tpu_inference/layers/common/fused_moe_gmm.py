@@ -220,10 +220,8 @@ def moe_gmm_local(
 
         token_hidden = token_topk_hidden.sum(axis=-2)
 
-    reduction_axis = (ShardingAxisName.MLP_TENSOR
-                      if parallelism == "tp" else ShardingAxisName.EXPERT)
-    # Then global reduction on all ranks for all tokens and all experts
-    return jax.lax.psum(token_hidden, axis_name=reduction_axis).astype(x.dtype)
+    # Return local sum without global reduction
+    return token_hidden.astype(x.dtype)
 
 
 def tensor_parallel_gmm(
@@ -331,7 +329,7 @@ def expert_parallel_gmm(
     w2_scale_spec = None if w2_scale is None else ep_p_spec
     w2_bias_spec = None if w2_bias is None else ep_p_spec
 
-    return jax.shard_map(
+    res = jax.shard_map(
         functools.partial(
             moe_gmm_local,
             activation=activation,
@@ -368,6 +366,18 @@ def expert_parallel_gmm(
         group_offset,
         topk_argsort_revert_indices,
         topk_weights,
+    )
+
+    # Apply the custom reduce-scatter kernel
+    from tpu_inference.kernels.collectives import hierarchical_reduce_scatter
+
+    # We assume 'res' needs reduction across ranks and scattering across the data axis.
+    # The kernel expects input to be sharded on the data axis.
+    return hierarchical_reduce_scatter(
+        res,
+        mesh=mesh,
+        in_specs=P(ShardingAxisName.MLP_DATA, None),
+        num_micro_batches=4,
     )
 
 

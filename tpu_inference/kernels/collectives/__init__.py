@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from tpu_inference.kernels.collectives.hierarchical_reduce_scatter import hierarchical_reduce_scatter
+
+__all__ = ["hierarchical_reduce_scatter"]
+

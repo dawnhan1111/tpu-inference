@@ -356,6 +356,9 @@ class VllmModelWrapper:
                 "post_spmd_conservative",
                 "xla_tpu_reduce_scatter_collective_matmul_mode":
                 "post_spmd_conservative"
+                "xla_tpu_check_legacy_constraints_in_reduce_scatter_legalizer":
+                False,
+                "xla_tpu_enable_sparse_core_reduce_scatter_padding": True,
             },
             static_argnames=("layer_name_to_kvcache_index", ),
         )

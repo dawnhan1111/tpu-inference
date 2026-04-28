@@ -21,6 +21,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
+import tpu_inference.kernels.collectives.hierarchical_reduce_scatter as hier_rs
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.kernels.sparse_core import gather_reduce as gather_reduce_sc
 from tpu_inference.kernels.sparse_core.ragged_gather import ragged_gather
@@ -144,6 +145,7 @@ def moe_gmm_local(
     parallelism: Literal["tp", "ep"],
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    enable_rs_kernel: bool = False,
 ) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
@@ -242,8 +244,29 @@ def moe_gmm_local(
     reduction_axis = (ShardingAxisName.MLP_TENSOR
                       if parallelism == "tp" else ShardingAxisName.EXPERT)
     # Then global reduction on all ranks for all tokens and all experts
-    return jax.lax.psum(token_hidden, axis_name=reduction_axis).astype(x.dtype)
+    if enable_rs_kernel:
+        reduction_axes = reduction_axis if isinstance(reduction_axis, tuple) else (reduction_axis,)
+        num_devices = 1
+        for axis in reduction_axes:
+            num_devices *= jax.lax.axis_size(axis)
 
+        # Fallback to psum for small token sizes to avoid Mosaic compilation errors.
+        # The threshold is chosen based on the tile dimension (8) in the hierarchical
+        # reduce-scatter kernel.
+        if token_hidden.shape[0] // num_devices < 8:
+            return jax.lax.psum(token_hidden, axis_name=reduction_axis).astype(x.dtype)
+
+        import tpu_inference.kernels.collectives.hierarchical_reduce_scatter as hier_rs
+        num_mb = 2
+        if token_hidden.shape[0] // num_devices > 600:
+            num_mb = 4
+
+        rs_token_hidden = hier_rs.hierarchical_reduce_scatter_local(
+            token_hidden, num_devices=num_devices, num_micro_batches=num_mb, axis_name=reduction_axis
+        )
+        return rs_token_hidden.astype(x.dtype)
+    else:
+        return jax.lax.psum(token_hidden, axis_name=reduction_axis).astype(x.dtype)
 
 def tensor_parallel_gmm(
     x: jax.Array,
@@ -262,6 +285,7 @@ def tensor_parallel_gmm(
     mesh: Mesh,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    enable_rs_kernel: bool = False,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     group_offset = jnp.array([0])
@@ -287,6 +311,7 @@ def tensor_parallel_gmm(
             parallelism="tp",
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+            enable_rs_kernel=enable_rs_kernel,
         ),
         mesh=mesh,
         in_specs=(
@@ -302,7 +327,7 @@ def tensor_parallel_gmm(
             data_p_spec,
             data_p_spec,
         ),
-        out_specs=(data_p_spec),
+        out_specs=P((ShardingAxisName.MLP_DATA,) + (ShardingAxisName.MLP_TENSOR if isinstance(ShardingAxisName.MLP_TENSOR, tuple) else (ShardingAxisName.MLP_TENSOR,)), None),
         check_vma=False,
     )(
         x,
@@ -336,6 +361,7 @@ def expert_parallel_gmm(
     mesh: Mesh,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    enable_rs_kernel: bool = False,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
@@ -357,6 +383,7 @@ def expert_parallel_gmm(
             parallelism="ep",
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+            enable_rs_kernel=enable_rs_kernel,
         ),
         mesh=mesh,
         in_specs=(
@@ -372,7 +399,7 @@ def expert_parallel_gmm(
             data_p_spec,
             data_p_spec,
         ),
-        out_specs=(data_p_spec),
+        out_specs=P((ShardingAxisName.MLP_DATA,) + (ShardingAxisName.EXPERT if isinstance(ShardingAxisName.EXPERT, tuple) else (ShardingAxisName.EXPERT,)), None),
         check_vma=False,
     )(
         x,
@@ -422,6 +449,7 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "sc_kernel_threshold",
     "sc_kernel_col_chunk_size",
     "all_gather_fp8",
+    "enable_rs_kernel",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -441,6 +469,7 @@ def fused_moe_func(
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
     all_gather_fp8: bool = False,
+    enable_rs_kernel: bool = False,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -573,6 +602,7 @@ def fused_moe_func(
             mesh=mesh,
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+            enable_rs_kernel=enable_rs_kernel,
         )
     else:
         x = tensor_parallel_gmm(
@@ -591,6 +621,7 @@ def fused_moe_func(
             mesh=mesh,
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+            enable_rs_kernel=enable_rs_kernel,
         )
 
     return x[:num_tokens, :hidden_size]

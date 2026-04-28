@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_SAVE_THREADS: int = 1
     TPU_OFFLOAD_BATCHED_SAVE: bool = False
     TPU_OFFLOAD_METRICS_LOG_INTERVAL: int = 5
+    ENABLE_RS_KERNEL: bool = False
 
 
 def env_with_choices(
@@ -281,6 +282,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv offload to dram: prometheus metrics log interval in seconds
     "TPU_OFFLOAD_METRICS_LOG_INTERVAL":
     lambda: int(os.getenv("TPU_OFFLOAD_METRICS_LOG_INTERVAL", "10")),
+    "ENABLE_RS_KERNEL": env_bool("ENABLE_RS_KERNEL", default=False),
 }
 
 

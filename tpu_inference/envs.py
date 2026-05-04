@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     MOE_APPROX_TOPK: bool = False
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
+    ENABLE_RS_KERNEL: bool = False
 
 
 def env_with_choices(
@@ -301,6 +302,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("DISABLE_WEIGHT_REQUANTIZATION", default=False),
     "VLLM_TPU_PATCH_MM_EMBEDDINGS":
     env_bool("VLLM_TPU_PATCH_MM_EMBEDDINGS", default=False),
+    # Enable hierarchical reduce-scatter kernel for MoE
+    "ENABLE_RS_KERNEL": env_bool("ENABLE_RS_KERNEL", default=False),
 }
 
 

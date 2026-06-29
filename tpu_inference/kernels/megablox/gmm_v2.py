@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Tuple
 
@@ -916,6 +917,25 @@ def calculate_tiling(
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
+
+    # Decode-gated tile_m for large-expert grouped MoE. When there are many
+    # groups (experts) but few rows per group (decode), a full tile_m pads each
+    # group's handful of real rows up to tile_m and spills registers, starving
+    # the MXU. Shrink tile_m toward the per-group row count. Gated to large-expert
+    # grouped matmul (size_group >= 256) so dense linear (1 group) and
+    # expert-parallel MoE (few experts/device) are untouched; the loop self-limits
+    # to decode since prefill's large rows-per-group keeps the original tile_m.
+    # Floor at 32: below that the 128-wide MXU under-fills faster than padding
+    # shrinks. Measured (gmm2 g384/m4096/k256/n8192, quantized fp4 path):
+    # tile_m 128 -> 32 cuts decode 429us -> 376us (-12%); prefill (m=65536)
+    # is unaffected (rows/group 170 keeps tile_m=128). The size_group>=256 gate
+    # already excludes expert-parallel MoE (few experts/device) and dense linear;
+    # the MOE_DECODE_TILE_M env var (default on) is an explicit kill-switch since
+    # this is only wanted for tensor-parallel MoE. Set MOE_DECODE_TILE_M=0 to disable.
+    if dims.size_group >= 256 and os.getenv("MOE_DECODE_TILE_M", "1") != "0":
+        rows_per_group = dims.size_m // dims.size_group
+        while tile_m > 32 and rows_per_group <= tile_m // 2:
+            tile_m //= 2
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.

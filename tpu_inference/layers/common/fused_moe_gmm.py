@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Literal
 
 import jax
@@ -23,7 +24,7 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives import \
     hierarchical_reduce_scatter as hier_rs
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.megablox.gmm_v2 import apply_act_fn, gmm_v2
 from tpu_inference.kernels.sparse_core.ragged_gather import ragged_gather
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce
@@ -151,13 +152,27 @@ def moe_gmm_local(x: jax.Array,
                   parallelism: Literal["tp", "ep"],
                   enable_rs_kernel: bool = False,
                   onehot_moe_permute_threshold: int = 0,
-                  scatter_results: bool = False) -> jax.Array:
+                  scatter_results: bool = False,
+                  tp_shard: str = "F") -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
-    Set parallelism for "tp" or "ep"
+    Set parallelism for "tp" or "ep". For TP, tp_shard selects which weight dim
+    is sharded: "F" (intermediate, standard column->row MLP, reduce after gmm2)
+    or "D" (hidden, row->column MLP: reduce after gmm1, output H-sharded).
     """
 
     assert parallelism in ["tp", "ep"]
+    # Both "D" and "DF" split the gmm1 contraction (hidden H), so gmm1 is partial
+    # and must be reduced before the activation; "F" (default) does not.
+    d_shard = (parallelism == "tp" and tp_shard in ("D", "DF"))
+
+    if parallelism == "tp" and tp_shard == "DF":
+        # per-device local shapes: expect x=[tok,H/D], w1=[E,H/D,2I/F],
+        # w2=[E,I/F,H/D] -> confirms H sharded over D and I over F.
+        logger.info("[MoE DF local] x=%s w1=%s w2=%s w1_scale=%s w2_scale=%s",
+                    x.shape, w1.shape, w2.shape,
+                    None if w1_scale is None else w1_scale.shape,
+                    None if w2_scale is None else w2_scale.shape)
 
     # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
     gmm1_res = gmm_wrapper(
@@ -167,9 +182,19 @@ def moe_gmm_local(x: jax.Array,
         w1_bias,
         group_sizes,
         group_offset,
-        fuse_act=activation,
+        fuse_act=(None if d_shard else activation),
         preferred_element_type=x.dtype,
     )
+    if d_shard:
+        # D-sharding: hidden (contraction of gmm1) is split, so gmm1 is partial.
+        # Reduce across the shard axis BEFORE the activation, then apply swiglu.
+        # Pure "D" reduces over the full MLP_TENSOR; the "DF" hybrid only splits H
+        # over the model (D) axis, so it reduces over that axis alone (the small,
+        # exposed mid-layer all-reduce).
+        gmm1_reduce_axis = (_df_shard_axes()[0]
+                            if tp_shard == "DF" else ShardingAxisName.MLP_TENSOR)
+        gmm1_res = jax.lax.psum(gmm1_res, axis_name=gmm1_reduce_axis)
+        gmm1_res = apply_act_fn(gmm1_res, activation)
 
     # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
     # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
@@ -223,6 +248,57 @@ def moe_gmm_local(x: jax.Array,
         cur_weighted = cur_sorted * cur_topk_weights
         cur_masked = jnp.where(mask, cur_weighted, 0.0)
         out = cur_masked.sum(axis=-2)
+
+    if d_shard and tp_shard == "DF":
+        # Hybrid DF: gmm2 contracts the F-sharded intermediate I, so its output is
+        # partial over the F axes AND sharded on hidden H over the D
+        # (attn_dp_expert) axis. Both D and F are attention data-parallel axes.
+        # (1) Reduce the F partials over `attn_dp` -- a reduce-scatter that also
+        #     scatters tokens onto attn_dp under DP-attention (scatter_results),
+        #     else a plain all-reduce.
+        # (2) Over the D axis `attn_dp_expert` (which also carries DP tokens):
+        #     all-to-all to scatter tokens onto it AND gather the H shards back to
+        #     full width -> residual layout (token-sharded 8-way, H-full). With no
+        #     DP-attention there are no tokens to scatter, so a plain all-gather.
+        d_axis, f_axis = _df_shard_axes()
+        if scatter_results:
+            dp_axes = ShardingAxisName.ATTN_DATA
+            reduce_axes = tuple(a for a in f_axis if a not in dp_axes)
+            scatter_axes = tuple(a for a in f_axis if a in dp_axes)
+            if reduce_axes:
+                out = jax.lax.psum(out, axis_name=reduce_axes)
+            if scatter_axes:
+                out = jax.lax.psum_scatter(out,
+                                           axis_name=scatter_axes,
+                                           scatter_dimension=0,
+                                           tiled=True)
+            out = jax.lax.all_to_all(out,
+                                     d_axis,
+                                     split_axis=0,
+                                     concat_axis=1,
+                                     tiled=True)
+        else:
+            out = jax.lax.psum(out, axis_name=f_axis)
+            out = jax.lax.all_gather(out, d_axis, axis=1, tiled=True)
+        return out.astype(x.dtype)
+
+    if d_shard:
+        # D-sharding: gmm2 output is H-sharded (no reduce needed). Reassemble to
+        # the residual layout. Under DP-attention (scatter_results) the residual is
+        # token-sharded + H-full, so all-to-all (split tokens, concat H); otherwise
+        # all-gather H to give token-full + H-full.
+        if scatter_results:
+            out = jax.lax.all_to_all(out,
+                                     ShardingAxisName.MLP_TENSOR,
+                                     split_axis=0,
+                                     concat_axis=1,
+                                     tiled=True)
+        else:
+            out = jax.lax.all_gather(out,
+                                     ShardingAxisName.MLP_TENSOR,
+                                     axis=1,
+                                     tiled=True)
+        return out.astype(x.dtype)
 
     # Then global reduction on all ranks for all tokens and all experts
     if enable_rs_kernel:
@@ -279,6 +355,24 @@ def moe_gmm_local(x: jax.Array,
     return out
 
 
+def _df_shard_axes():
+    """Mesh axes for the hybrid "DF" MoE sharding (MOE_TP_SHARD=DF).
+
+    Both axes are attention DATA-PARALLEL sub-axes, so attention stays a plain
+    8-way DP with full heads and MLA is NEVER TP-sharded (model stays 1):
+      D = 'attn_dp_expert' shards the hidden dim H (gives gmm2 a deeper K than
+          pure-F); its collectives are a 2-way all-reduce (mid) + all-to-all (end).
+      F = MLP_TENSOR minus attn_dp_expert (i.e. 'attn_dp') shards the intermediate.
+    With attn_dp_size=8 + attn_dp_expert_size=2 on TP=8 this is a 2-way D
+    (attn_dp_expert) x 4-way F (attn_dp) split. Returns ``(d_axis, f_axis)``.
+    """
+    d_axis = "attn_dp_expert"
+    mt = ShardingAxisName.MLP_TENSOR
+    mt = mt if isinstance(mt, tuple) else (mt, )
+    f_axis = tuple(a for a in mt if a != d_axis)
+    return d_axis, f_axis
+
+
 def tensor_parallel_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -298,22 +392,69 @@ def tensor_parallel_gmm(
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
 ) -> jax.Array:
+    tp_shard = os.getenv("MOE_TP_SHARD", "F")
+    MT = ShardingAxisName.MLP_TENSOR
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     group_offset = jnp.array([0])
 
-    w1_spec = P(None, None, ShardingAxisName.MLP_TENSOR)
-    w2_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
-
-    w1_scale_spec = (None if w1_scale is None else P(
-        None, None, None, ShardingAxisName.MLP_TENSOR))
-    w1_bias_spec = (None if w1_bias is None else P(
-        None, None, ShardingAxisName.MLP_TENSOR))
-
     num_blocks = 1 if w2_scale is None else w2_scale.shape[1]
-    w2_scale_spec = (None if num_blocks == 1 else P(
-        None, ShardingAxisName.MLP_TENSOR, None, None))
-    w2_bias_spec = None if w2_bias is None else P(None, None, None)
+    if tp_shard == "D":
+        # Shard hidden H: w1=[E,H,2I] dim1, w2=[E,I,H] dim2; x sharded on H so
+        # gmm1 contracts H/N (reduce after gmm1); gmm2 contracts full I (deep K).
+        x_in_spec = P(ShardingAxisName.MLP_DATA, MT)
+        w1_spec = P(None, MT, None)
+        w2_spec = P(None, None, MT)
+        w1_scale_spec = (None if w1_scale is None else P(None, MT, None, None))
+        w1_bias_spec = (None if w1_bias is None else P(None, None, None))
+        w2_scale_spec = (None if w2_scale is None else P(None, None, None, MT))
+        w2_bias_spec = None if w2_bias is None else P(None, None, MT)
+    elif tp_shard == "DF":
+        # Hybrid: shard hidden H over the D axis 'attn_dp_expert' AND intermediate
+        # 2I/I over the F axis 'attn_dp' (both are attention DP axes, so model stays
+        # 1 and MLA is untouched). w1=[E,H,2I], w2=[E,I,H]. gmm1 contracts H/D
+        # (reduce over D after gmm1); gmm2 contracts I/F (reduce over F after gmm2),
+        # giving K = I/F -- deeper than pure-F's I/8.
+        d_axis, f_axis = _df_shard_axes()
+        x_in_spec = P(ShardingAxisName.MLP_DATA, d_axis)
+        w1_spec = P(None, d_axis, f_axis)
+        w2_spec = P(None, f_axis, d_axis)
+        w1_scale_spec = (None if w1_scale is None else
+                         P(None, d_axis, None, f_axis))
+        w1_bias_spec = (None if w1_bias is None else P(None, None, f_axis))
+        if w2_scale is None:
+            w2_scale_spec = None
+        elif num_blocks == 1:
+            # per-channel along I: the I-block dim is size 1, not shardable over F.
+            w2_scale_spec = P(None, None, None, d_axis)
+        else:
+            w2_scale_spec = P(None, f_axis, None, d_axis)
+        w2_bias_spec = None if w2_bias is None else P(None, None, d_axis)
+        d_deg = get_mesh_shape_product(mesh, d_axis)
+        f_deg = get_mesh_shape_product(mesh, f_axis)
+        logger.info(
+            "[MoE DF] d_axis=%s(x%d) f_axis=%s(x%d) | global shapes: "
+            "x=%s w1=%s(H,2I) w2=%s(I,H) w1_scale=%s w2_scale=%s | "
+            "x_spec=%s w1_spec=%s w2_spec=%s", d_axis, d_deg, f_axis, f_deg,
+            x.shape, w1.shape, w2.shape,
+            None if w1_scale is None else w1_scale.shape,
+            None if w2_scale is None else w2_scale.shape, x_in_spec, w1_spec,
+            w2_spec)
+    else:
+        # F (default): shard intermediate 2I/I (standard column->row MLP).
+        x_in_spec = data_p_spec
+        w1_spec = P(None, None, MT)
+        w2_spec = P(None, MT, None)
+        w1_scale_spec = (None if w1_scale is None else P(None, None, None, MT))
+        w1_bias_spec = (None if w1_bias is None else P(None, None, MT))
+        w2_scale_spec = (None if num_blocks == 1 else P(None, MT, None, None))
+        w2_bias_spec = None if w2_bias is None else P(None, None, None)
+
+    if tp_shard in ("D", "DF") and x.shape[-1] != w1.shape[1]:
+        # w13's contraction (H) was padded for quant-block alignment; pad x to
+        # match so it shards to the same per-chip size as the weight. gmm2's
+        # output H (w2) is unpadded, so the result needs no un-padding.
+        x = jnp.pad(x, [(0, 0), (0, w1.shape[1] - x.shape[-1])])
 
     if scatter_results:
         final_out_specs = attn_data_p_spec
@@ -329,10 +470,11 @@ def tensor_parallel_gmm(
             enable_rs_kernel=False,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
+            tp_shard=tp_shard,
         ),
         mesh=mesh,
         in_specs=(
-            data_p_spec,
+            x_in_spec,
             w1_spec,
             w1_scale_spec,
             w1_bias_spec,

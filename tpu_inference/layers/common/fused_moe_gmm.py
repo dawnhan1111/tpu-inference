@@ -326,12 +326,15 @@ def moe_gmm_local(x: jax.Array,
                 topk_weights,
                 topk,
             )
+        # compute_dtype, not x.dtype: on the fp8 path x is the quantized
+        # activation buffer, so casting the result to x.dtype would hand fp8
+        # back to the caller's residual add.
         if enable_rs_kernel:
             rs_out = hier_rs_sc.hierarchical_reduce_scatter_local(
                 chunk_hidden,
                 num_devices=scatter_axis_size,
                 axis_name=reduction_axis)
-            out = rs_out.astype(x.dtype)
+            out = rs_out.astype(compute_dtype)
         elif scatter_results:
             if reduce_axes:
                 chunk_hidden = jax.lax.psum(chunk_hidden,
@@ -340,15 +343,15 @@ def moe_gmm_local(x: jax.Array,
                 out = jax.lax.psum_scatter(chunk_hidden,
                                            axis_name=scatter_axes,
                                            scatter_dimension=0,
-                                           tiled=True).astype(x.dtype)
+                                           tiled=True).astype(compute_dtype)
             else:
-                out = chunk_hidden.astype(x.dtype)
+                out = chunk_hidden.astype(compute_dtype)
         else:
             if not defer_all_reduce:
-                out = jax.lax.psum(chunk_hidden,
-                                   axis_name=reduction_axis).astype(x.dtype)
+                out = jax.lax.psum(
+                    chunk_hidden, axis_name=reduction_axis).astype(compute_dtype)
             else:
-                out = chunk_hidden.astype(x.dtype)
+                out = chunk_hidden.astype(compute_dtype)
         out_list.append(out)
 
     return jnp.concatenate(out_list,
